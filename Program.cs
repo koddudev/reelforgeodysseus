@@ -309,7 +309,7 @@ internal static class ChatRouter
         if (type is "image" or "img" or "picture")
         {
             if (IsAdvertisementBlueprintRequest(message))
-                return LocalAdImageRenderer.Generate(BlueprintGenerator.Generate(message), model);
+                return await MediaPackageGenerator.GenerateImageAsync(BlueprintGenerator.Generate(message), model, httpClientFactory, configuration, cancellationToken);
 
             var imagePrompt = message;
             var imageModel = ImageGenerator.IsKnownImageModel(model) ? model : "pollinations";
@@ -317,7 +317,7 @@ internal static class ChatRouter
         }
 
         if (type is "video" or "reel")
-            return VideoManifestGenerator.Generate(message);
+            return MediaPackageGenerator.GenerateVideo(BlueprintGenerator.Generate(message), model);
 
         if (type is "blueprint" or "ad-blueprint")
         {
@@ -360,6 +360,100 @@ internal static class AdvertisementMediaPromptBuilder
         var visual = firstScene?.VisualPrompt ?? blueprint.Hook;
         var caption = blueprint.Captions.FirstOrDefault() ?? blueprint.CallToAction;
         return $"Premium commercial social ad image for {blueprint.AdTitle}. {visual}. Include a polished brand-forward composition, modern lighting, clean product/service presentation, subtle text overlay reading \"{caption}\", and a clear CTA: {blueprint.CallToAction}.";
+    }
+
+    public static string BuildPhotorealisticImagePrompt(LocalAdBlueprint blueprint)
+    {
+        var firstScene = blueprint.Scenes.FirstOrDefault();
+        var visual = firstScene?.VisualPrompt ?? blueprint.Hook;
+        var caption = blueprint.Captions.FirstOrDefault() ?? blueprint.CallToAction;
+        return $"""
+            Photorealistic premium commercial social ad image for {blueprint.AdTitle}.
+            Scene: {visual}
+            Style: inviting real photography, modern office breakroom, real people smiling and interacting naturally, premium smart vending/snack service, polished lighting, shallow depth of field, clean brand-forward composition, no cartoon, no illustration, no flat UI mockup.
+            Text overlay: "{caption}"
+            CTA: "{blueprint.CallToAction}"
+            Composition: vertical/social crop safe, realistic people, realistic vending machine or snack display, warm professional atmosphere, high-end advertising photography.
+            """;
+    }
+}
+
+internal static class MediaPackageGenerator
+{
+    public static async Task<string> GenerateImageAsync(LocalAdBlueprint blueprint, string model, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken)
+    {
+        var imagePrompt = AdvertisementMediaPromptBuilder.BuildPhotorealisticImagePrompt(blueprint);
+        var imageModel = ImageGenerator.IsKnownImageModel(model) && !model.Equals("pollinations", StringComparison.OrdinalIgnoreCase)
+            ? model
+            : "gpt-image-1.5";
+        var apiKey = configuration["OpenAI:ApiKey"] ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? "";
+        object media;
+
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            media = new
+            {
+                Type = "image",
+                Status = "provider_required",
+                Provider = "OpenAI Images, Stability AI, Flux, or another photoreal image provider",
+                Model = imageModel,
+                ImageUrl = (string?)null,
+                ImageDataUrl = (string?)null,
+                Prompt = imagePrompt,
+                Message = "Photorealistic ad images require a real image-generation provider. No image key/provider is configured, so no low-quality SVG or queued free-generator image was returned."
+            };
+        }
+        else
+        {
+            var imageJson = await ImageGenerator.GenerateOpenAiAsync(imagePrompt, imageModel, apiKey, httpClientFactory, cancellationToken);
+            media = JsonSerializer.Deserialize<JsonElement>(imageJson);
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            Type = "image",
+            Blueprint = blueprint,
+            Media = media
+        });
+    }
+
+    public static string GenerateVideo(LocalAdBlueprint blueprint, string model)
+    {
+        return JsonSerializer.Serialize(new
+        {
+            Type = "video",
+            Blueprint = blueprint,
+            Media = new
+            {
+                Type = "video",
+                Status = "provider_required",
+                Provider = "Runway, Pika, Sora, Luma, Kling, HeyGen, Synthesia, Remotion, or another real video renderer",
+                Model = string.IsNullOrWhiteSpace(model) ? "video-provider-required" : model,
+                VideoUrl = (string?)null,
+                Message = "Real motion video with moving people, narration, and music requires a video generation/rendering provider. Returned a production-ready video brief and timeline instead of a fake slideshow.",
+                CreativeDirection = "Photoreal commercial reel with real people moving naturally in an office/breakroom setting, premium smart vending machine interactions, expressive narration, polished music, natural camera movement, and motivated transitions.",
+                AspectRatio = "9:16",
+                DurationSeconds = 30,
+                VoiceoverScript = blueprint.VoiceoverScript,
+                TtsDirection = blueprint.TtsDirection,
+                MusicDirection = blueprint.MusicDirection,
+                ShotList = blueprint.Scenes.Select(scene => new
+                {
+                    scene.SceneNumber,
+                    scene.StartTime,
+                    scene.EndTime,
+                    scene.Purpose,
+                    ShotPrompt = $"{scene.VisualPrompt}. Show real people moving naturally, interacting with the environment, and avoid static slideshow composition.",
+                    scene.CameraDirection,
+                    scene.MotionDirection,
+                    scene.OnScreenText,
+                    scene.VoiceoverSegment,
+                    Transition = $"{scene.TransitionIn} -> {scene.TransitionOut}",
+                    scene.BrollType,
+                    scene.EmotionalTone
+                })
+            }
+        });
     }
 }
 
@@ -528,6 +622,11 @@ internal static class ImageGenerator
             return GeneratePollinationsResponse(message, model, "No-key Pollinations image URL generated.");
 
         var prompt = NormalizeImagePrompt(message);
+        return await GenerateOpenAiAsync(prompt, model, apiKey, httpClientFactory, cancellationToken);
+    }
+
+    public static async Task<string> GenerateOpenAiAsync(string prompt, string model, string apiKey, IHttpClientFactory httpClientFactory, CancellationToken cancellationToken)
+    {
         using var http = httpClientFactory.CreateClient();
         http.Timeout = TimeSpan.FromMinutes(3);
         http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey.Trim());
