@@ -1,8 +1,19 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(options =>
+{
+    options.SwaggerDoc("v1", new OpenApiInfo
+    {
+        Title = "ReelForge Odysseus API",
+        Version = "v1",
+        Description = "Odysseus-compatible .NET workspace endpoints for ReelForge media generation."
+    });
+});
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
     options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
@@ -18,24 +29,37 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 var sessions = new ConcurrentDictionary<string, OdysseusSession>();
+var swaggerEnabled = app.Configuration.GetValue("Swagger:Enabled", true);
 
 app.UseCors();
+
+if (swaggerEnabled)
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
 
 app.MapGet("/", () => Results.Json(new
 {
     service = "ReelForge Odysseus .NET Workspace",
     status = "running",
-    endpoints = new[] { "/health", "/api/default-chat", "/session", "/api/chat" }
-}));
+    endpoints = new[] { "/health", "/api/default-chat", "/session", "/api/chat", "/swagger" }
+}))
+    .WithName("Root")
+    .WithOpenApi();
 
-app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
+app.MapGet("/health", () => Results.Ok(new { status = "healthy" }))
+    .WithName("Health")
+    .WithOpenApi();
 
 app.MapGet("/api/default-chat", () => Results.Ok(new
 {
     endpoint_id = "reelforge-dotnet",
     endpoint_url = $"{GetPublicBaseUrl(app.Configuration)}/api/chat",
     model = "reelforge-commercial-blueprint-v1"
-}));
+}))
+    .WithName("GetDefaultChat")
+    .WithOpenApi();
 
 app.MapPost("/session", async (HttpRequest request) =>
 {
@@ -47,7 +71,10 @@ app.MapPost("/session", async (HttpRequest request) =>
 
     sessions[id] = new OdysseusSession(id, model, endpointId, endpointUrl, DateTimeOffset.UtcNow);
     return Results.Ok(new { id, model, endpoint_id = endpointId, endpoint_url = endpointUrl });
-});
+})
+    .Accepts<IFormCollection>("application/x-www-form-urlencoded")
+    .WithName("CreateSession")
+    .WithOpenApi();
 
 app.MapPost("/api/chat", (OdysseusChatRequest request) =>
 {
@@ -61,7 +88,9 @@ app.MapPost("/api/chat", (OdysseusChatRequest request) =>
         session = sessionId,
         model = sessions[sessionId].Model
     });
-});
+})
+    .WithName("Chat")
+    .WithOpenApi();
 
 app.Run();
 
