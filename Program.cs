@@ -46,7 +46,7 @@ app.MapGet("/", () => Results.Json(new
 {
     service = "ReelForge Odysseus .NET Workspace",
     status = "running",
-    endpoints = new[] { "/health", "/api/default-chat", "/session", "/api/chat", "/swagger" }
+    endpoints = new[] { "/health", "/api/default-chat", "/session", "/api/chat", "/api/video/{videoId}", "/api/video/{videoId}/content", "/swagger" }
 }))
     .WithName("Root")
     .WithOpenApi();
@@ -58,7 +58,7 @@ app.MapGet("/health", () => Results.Ok(new { status = "healthy" }))
 app.MapGet("/api/default-chat", () => Results.Ok(new
 {
     endpoint_id = "reelforge-dotnet",
-    endpoint_url = $"{GetPublicBaseUrl(app.Configuration)}/api/chat",
+    endpoint_url = $"{PublicUrl.Get(app.Configuration)}/api/chat",
     model = "reelforge-commercial-blueprint-v1"
 }))
     .WithName("GetDefaultChat")
@@ -69,7 +69,7 @@ app.MapPost("/session", async (HttpRequest request) =>
     var form = await request.ReadFormAsync();
     var model = ValueOrDefault(form["model"].ToString(), "reelforge-commercial-blueprint-v1");
     var endpointId = ValueOrDefault(form["endpoint_id"].ToString(), "reelforge-dotnet");
-    var endpointUrl = ValueOrDefault(form["endpoint_url"].ToString(), $"{GetPublicBaseUrl(app.Configuration)}/api/chat");
+    var endpointUrl = ValueOrDefault(form["endpoint_url"].ToString(), $"{PublicUrl.Get(app.Configuration)}/api/chat");
     var id = Guid.NewGuid().ToString("N");
 
     sessions[id] = new OdysseusSession(id, model, endpointId, endpointUrl, DateTimeOffset.UtcNow);
@@ -101,18 +101,37 @@ app.MapPost("/api/chat", async (OdysseusChatRequest request, IHttpClientFactory 
     .WithName("Chat")
     .WithOpenApi();
 
-app.Run();
-
-static string GetPublicBaseUrl(IConfiguration configuration)
+app.MapGet("/api/video/{videoId}", async (string videoId, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken) =>
 {
-    var configured = configuration["PUBLIC_BASE_URL"];
-    if (!string.IsNullOrWhiteSpace(configured)) return configured.TrimEnd('/');
-    var host = configuration["WEBSITE_HOSTNAME"];
-    return string.IsNullOrWhiteSpace(host) ? "" : $"https://{host}";
-}
+    var result = await OpenAiVideoGenerator.GetStatusAsync(videoId, httpClientFactory, configuration, cancellationToken);
+    return Results.Content(result, "application/json");
+})
+    .WithName("GetVideoStatus")
+    .WithOpenApi();
+
+app.MapGet("/api/video/{videoId}/content", async (string videoId, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken) =>
+{
+    var stream = await OpenAiVideoGenerator.DownloadContentAsync(videoId, httpClientFactory, configuration, cancellationToken);
+    return Results.File(stream, "video/mp4", $"{videoId}.mp4");
+})
+    .WithName("DownloadVideoContent")
+    .WithOpenApi();
+
+app.Run();
 
 static string ValueOrDefault(string? value, string fallback) =>
     string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
+
+internal static class PublicUrl
+{
+    public static string Get(IConfiguration configuration)
+    {
+        var configured = configuration["PUBLIC_BASE_URL"];
+        if (!string.IsNullOrWhiteSpace(configured)) return configured.TrimEnd('/');
+        var host = configuration["WEBSITE_HOSTNAME"];
+        return string.IsNullOrWhiteSpace(host) ? "" : $"https://{host}";
+    }
+}
 
 internal sealed record OdysseusSession(string Id, string Model, string EndpointId, string EndpointUrl, DateTimeOffset CreatedAt);
 
@@ -317,7 +336,7 @@ internal static class ChatRouter
         }
 
         if (type is "video" or "reel")
-            return MediaPackageGenerator.GenerateVideo(BlueprintGenerator.Generate(message), model);
+            return await MediaPackageGenerator.GenerateVideoAsync(BlueprintGenerator.Generate(message), model, httpClientFactory, configuration, cancellationToken);
 
         if (type is "blueprint" or "ad-blueprint")
         {
@@ -417,44 +436,204 @@ internal static class MediaPackageGenerator
         });
     }
 
-    public static string GenerateVideo(LocalAdBlueprint blueprint, string model)
+    public static async Task<string> GenerateVideoAsync(LocalAdBlueprint blueprint, string model, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken)
     {
+        var baseUrl = PublicUrl.Get(configuration);
+        var videoPrompt = BuildVideoPrompt(blueprint);
+        var videoModel = IsKnownVideoModel(model) ? model : "sora-2";
+        var apiKey = configuration["OpenAI:ApiKey"] ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? "";
+        object media;
+
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            media = BuildProviderRequiredVideoMedia(blueprint, videoModel, videoPrompt);
+        }
+        else
+        {
+            var video = await OpenAiVideoGenerator.CreateAsync(videoPrompt, videoModel, baseUrl, httpClientFactory, configuration, cancellationToken);
+            media = video;
+        }
+
         return JsonSerializer.Serialize(new
         {
             Type = "video",
             Blueprint = blueprint,
-            Media = new
+            Media = media
+        });
+    }
+
+    private static bool IsKnownVideoModel(string model) =>
+        model.Equals("sora-2", StringComparison.OrdinalIgnoreCase)
+        || model.Equals("sora-2-pro", StringComparison.OrdinalIgnoreCase);
+
+    private static object BuildProviderRequiredVideoMedia(LocalAdBlueprint blueprint, string model, string prompt) => new
+    {
+        Type = "video",
+        Status = "provider_required",
+        Provider = "OpenAI Sora Video API",
+        Model = model,
+        VideoId = (string?)null,
+        VideoUrl = (string?)null,
+        Prompt = prompt,
+        Message = "OPENAI_API_KEY is not configured on this app service, so Sora video generation could not be started. The blueprint and production-ready Sora prompt are included.",
+        CreativeDirection = "Photoreal commercial reel with professional actors moving naturally in an office/breakroom setting, premium smart vending machine interactions, expressive narration, polished music, natural camera movement, and motivated transitions.",
+        AspectRatio = "9:16",
+        DurationSeconds = 8,
+        VoiceoverScript = blueprint.VoiceoverScript,
+        TtsDirection = blueprint.TtsDirection,
+        MusicDirection = blueprint.MusicDirection,
+        ShotList = blueprint.Scenes.Select(scene => new
+        {
+            scene.SceneNumber,
+            scene.StartTime,
+            scene.EndTime,
+            scene.Purpose,
+            ShotPrompt = $"{scene.VisualPrompt}. Show professional actors moving naturally, interacting with the environment, and avoid static slideshow composition.",
+            scene.CameraDirection,
+            scene.MotionDirection,
+            scene.OnScreenText,
+            scene.VoiceoverSegment,
+            Transition = $"{scene.TransitionIn} -> {scene.TransitionOut}",
+            scene.BrollType,
+            scene.EmotionalTone
+        })
+    };
+
+    private static string BuildVideoPrompt(LocalAdBlueprint blueprint)
+    {
+        var shotList = string.Join("\n", blueprint.Scenes.Select(scene =>
+            $"- {scene.StartTime:0.0}s-{scene.EndTime:0.0}s: {scene.VisualPrompt}. Camera: {scene.CameraDirection}. Motion: {scene.MotionDirection}. On-screen text: {scene.OnScreenText}. Transition: {scene.TransitionIn} to {scene.TransitionOut}."));
+
+        return $"""
+            Create an 8-second vertical photoreal commercial video for social media.
+
+            Brand/ad: {blueprint.AdTitle}
+            Goal: {blueprint.Hook} {blueprint.EmotionalAngle}
+            Visual direction: premium modern office breakroom, professional actors moving naturally, happy employees interacting with a smart vending/snack service, realistic lighting, polished camera movement, no slideshow, no static cards, no cartoon, no illustration.
+            Audio direction: include synced commercial narration, natural expressive voice, polished upbeat background music, and tasteful audio ducking under narration.
+            Narration script: {blueprint.VoiceoverScript}
+            Music: {blueprint.MusicDirection}
+            CTA: {blueprint.CallToAction}
+
+            Shot list:
+            {shotList}
+
+            Keep all people generic professional actors. Do not depict any real named person or public figure. Do not use copyrighted music. Make the result feel like a real filmed commercial with people moving, not a slideshow.
+            """;
+    }
+}
+
+internal static class OpenAiVideoGenerator
+{
+    public static async Task<object> CreateAsync(string prompt, string model, string baseUrl, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken)
+    {
+        var apiKey = configuration["OpenAI:ApiKey"] ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? "";
+        if (string.IsNullOrWhiteSpace(apiKey))
+            return new
             {
                 Type = "video",
                 Status = "provider_required",
-                Provider = "Runway, Pika, Sora, Luma, Kling, HeyGen, Synthesia, Remotion, or another real video renderer",
-                Model = string.IsNullOrWhiteSpace(model) ? "video-provider-required" : model,
+                Provider = "OpenAI Sora Video API",
+                Model = model,
+                VideoId = (string?)null,
                 VideoUrl = (string?)null,
-                Message = "Real motion video with moving people, narration, and music requires a video generation/rendering provider. Returned a production-ready video brief and timeline instead of a fake slideshow.",
-                CreativeDirection = "Photoreal commercial reel with real people moving naturally in an office/breakroom setting, premium smart vending machine interactions, expressive narration, polished music, natural camera movement, and motivated transitions.",
-                AspectRatio = "9:16",
-                DurationSeconds = 30,
-                VoiceoverScript = blueprint.VoiceoverScript,
-                TtsDirection = blueprint.TtsDirection,
-                MusicDirection = blueprint.MusicDirection,
-                ShotList = blueprint.Scenes.Select(scene => new
-                {
-                    scene.SceneNumber,
-                    scene.StartTime,
-                    scene.EndTime,
-                    scene.Purpose,
-                    ShotPrompt = $"{scene.VisualPrompt}. Show real people moving naturally, interacting with the environment, and avoid static slideshow composition.",
-                    scene.CameraDirection,
-                    scene.MotionDirection,
-                    scene.OnScreenText,
-                    scene.VoiceoverSegment,
-                    Transition = $"{scene.TransitionIn} -> {scene.TransitionOut}",
-                    scene.BrollType,
-                    scene.EmotionalTone
-                })
-            }
-        });
+                StatusUrl = (string?)null,
+                Prompt = prompt,
+                Message = "OPENAI_API_KEY is not configured on this app service, so Sora video generation could not be started."
+            };
+
+        using var http = CreateOpenAiClient(httpClientFactory, apiKey);
+        var payload = new
+        {
+            model,
+            prompt,
+            size = "720x1280",
+            seconds = "8"
+        };
+
+        using var requestBody = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        using var response = await http.PostAsync("https://api.openai.com/v1/videos", requestBody, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+            return new
+            {
+                Type = "video",
+                Status = "generation_error",
+                Provider = "OpenAI Sora Video API",
+                Model = model,
+                VideoId = (string?)null,
+                VideoUrl = (string?)null,
+                StatusUrl = (string?)null,
+                Prompt = prompt,
+                Message = $"OpenAI video generation failed: {(int)response.StatusCode} {response.ReasonPhrase}. {Shorten(body, 1200)}"
+            };
+
+        using var document = JsonDocument.Parse(body);
+        var root = document.RootElement;
+        var id = root.TryGetProperty("id", out var idElement) ? idElement.GetString() : null;
+        var status = root.TryGetProperty("status", out var statusElement) ? statusElement.GetString() : "queued";
+        var progress = root.TryGetProperty("progress", out var progressElement) && progressElement.TryGetInt32(out var progressValue) ? progressValue : (int?)null;
+        var statusUrl = string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(baseUrl) ? null : $"{baseUrl}/api/video/{id}";
+        var contentUrl = string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(baseUrl) ? null : $"{baseUrl}/api/video/{id}/content";
+
+        return new
+        {
+            Type = "video",
+            Status = status,
+            Provider = "OpenAI Sora Video API",
+            Model = model,
+            VideoId = id,
+            VideoUrl = status == "completed" ? contentUrl : null,
+            StatusUrl = statusUrl,
+            ContentUrl = contentUrl,
+            Progress = progress,
+            Prompt = prompt,
+            Message = status == "completed"
+                ? "Sora video generation completed. Download the MP4 from VideoUrl."
+                : "Sora video generation started. Poll StatusUrl until status is completed, then download ContentUrl."
+        };
     }
+
+    public static async Task<string> GetStatusAsync(string videoId, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken)
+    {
+        var apiKey = configuration["OpenAI:ApiKey"] ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? "";
+        if (string.IsNullOrWhiteSpace(apiKey))
+            return JsonSerializer.Serialize(new { status = "provider_required", message = "OPENAI_API_KEY is not configured." });
+
+        using var http = CreateOpenAiClient(httpClientFactory, apiKey);
+        using var response = await http.GetAsync($"https://api.openai.com/v1/videos/{Uri.EscapeDataString(videoId)}", cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+            return JsonSerializer.Serialize(new { status = "status_error", message = $"OpenAI video status failed: {(int)response.StatusCode} {response.ReasonPhrase}. {Shorten(body, 1200)}" });
+
+        return body;
+    }
+
+    public static async Task<Stream> DownloadContentAsync(string videoId, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken)
+    {
+        var apiKey = configuration["OpenAI:ApiKey"] ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? "";
+        if (string.IsNullOrWhiteSpace(apiKey))
+            throw new InvalidOperationException("OPENAI_API_KEY is not configured.");
+
+        using var http = CreateOpenAiClient(httpClientFactory, apiKey);
+        using var response = await http.GetAsync($"https://api.openai.com/v1/videos/{Uri.EscapeDataString(videoId)}/content", cancellationToken);
+        var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"OpenAI video download failed: {(int)response.StatusCode} {response.ReasonPhrase}. {Encoding.UTF8.GetString(bytes)}");
+
+        return new MemoryStream(bytes);
+    }
+
+    private static HttpClient CreateOpenAiClient(IHttpClientFactory httpClientFactory, string apiKey)
+    {
+        var http = httpClientFactory.CreateClient();
+        http.Timeout = TimeSpan.FromMinutes(5);
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey.Trim());
+        return http;
+    }
+
+    private static string Shorten(string value, int maxLength) =>
+        value.Length <= maxLength ? value : value[..maxLength].TrimEnd() + "...";
 }
 
 internal static class LocalAdImageRenderer
