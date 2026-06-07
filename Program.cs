@@ -81,10 +81,10 @@ app.MapPost("/api/chat", (OdysseusChatRequest request) =>
     var sessionId = ValueOrDefault(request.Session, Guid.NewGuid().ToString("N"));
     sessions.TryAdd(sessionId, new OdysseusSession(sessionId, "reelforge-commercial-blueprint-v1", "reelforge-dotnet", "/api/chat", DateTimeOffset.UtcNow));
 
-    var blueprint = BlueprintGenerator.Generate(request.Message);
+    var response = ChatRouter.GetResponse(request.Message);
     return Results.Ok(new
     {
-        response = JsonSerializer.Serialize(blueprint, JsonOptions.Default.LocalAdBlueprint),
+        response,
         session = sessionId,
         model = sessions[sessionId].Model
     });
@@ -288,6 +288,48 @@ internal static class BlueprintGenerator
 
     private static string Shorten(string value, int maxLength) =>
         value.Length <= maxLength ? value : value[..maxLength].TrimEnd() + "...";
+}
+
+internal static class ChatRouter
+{
+    public static string GetResponse(string message)
+    {
+        if (IsAdvertisementBlueprintRequest(message))
+        {
+            var blueprint = BlueprintGenerator.Generate(message);
+            return JsonSerializer.Serialize(blueprint, JsonOptions.Default.LocalAdBlueprint);
+        }
+
+        return GeneralChatResponder.Answer(message);
+    }
+
+    private static bool IsAdvertisementBlueprintRequest(string message)
+    {
+        var lower = message.ToLowerInvariant();
+        return lower.Contains("advertisement blueprint")
+            || lower.Contains("commercial-quality advertisement")
+            || lower.Contains("return only valid json")
+            || lower.Contains("\"businessname\"")
+            || lower.Contains("\"productorservice\"")
+            || lower.Contains("creative brief:")
+            || lower.Contains("source topic/supporting information:");
+    }
+}
+
+internal static class GeneralChatResponder
+{
+    public static string Answer(string message)
+    {
+        var normalized = message.Trim().ToLowerInvariant();
+
+        if (normalized.Contains("age of the earth") || normalized.Contains("old is the earth"))
+            return "The Earth is about 4.54 billion years old, based mainly on radiometric dating of meteorites, Moon rocks, and Earth minerals.";
+
+        if (normalized.Contains("health") || normalized.Contains("status"))
+            return "The ReelForge Odysseus .NET workspace is running.";
+
+        return "I can answer general questions and also generate ReelForge ad blueprints. For media generation, send a prompt that includes a creative brief or asks for an advertisement blueprint.";
+    }
 }
 
 [JsonSerializable(typeof(LocalAdBlueprint))]
