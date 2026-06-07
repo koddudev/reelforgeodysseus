@@ -303,14 +303,14 @@ internal static class ChatRouter
 {
     public static async Task<string> GetResponseAsync(string message, string model, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken)
     {
-        if (ImageGenerator.IsImageGenerationRequest(message, model))
-            return await ImageGenerator.GenerateAsync(message, model, httpClientFactory, configuration, cancellationToken);
-
         if (IsAdvertisementBlueprintRequest(message))
         {
             var blueprint = BlueprintGenerator.Generate(message);
             return JsonSerializer.Serialize(blueprint, JsonOptions.Default.LocalAdBlueprint);
         }
+
+        if (ImageGenerator.IsImageGenerationRequest(message, model))
+            return await ImageGenerator.GenerateAsync(message, model, httpClientFactory, configuration, cancellationToken);
 
         return GeneralChatResponder.Answer(message);
     }
@@ -324,7 +324,9 @@ internal static class ChatRouter
             || lower.Contains("\"businessname\"")
             || lower.Contains("\"productorservice\"")
             || lower.Contains("creative brief:")
-            || lower.Contains("source topic/supporting information:");
+            || lower.Contains("source topic/supporting information:")
+            || lower.Contains("video reel")
+            || lower.Contains("media-generation request");
     }
 }
 
