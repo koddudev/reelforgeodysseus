@@ -308,9 +308,10 @@ internal static class ChatRouter
         var type = (requestedType ?? "").Trim().ToLowerInvariant();
         if (type is "image" or "img" or "picture")
         {
-            var imagePrompt = IsAdvertisementBlueprintRequest(message)
-                ? AdvertisementMediaPromptBuilder.BuildImagePrompt(BlueprintGenerator.Generate(message))
-                : message;
+            if (IsAdvertisementBlueprintRequest(message))
+                return LocalAdImageRenderer.Generate(BlueprintGenerator.Generate(message), model);
+
+            var imagePrompt = message;
             var imageModel = ImageGenerator.IsKnownImageModel(model) ? model : "pollinations";
             return await ImageGenerator.GenerateAsync(imagePrompt, imageModel, httpClientFactory, configuration, cancellationToken);
         }
@@ -360,6 +361,70 @@ internal static class AdvertisementMediaPromptBuilder
         var caption = blueprint.Captions.FirstOrDefault() ?? blueprint.CallToAction;
         return $"Premium commercial social ad image for {blueprint.AdTitle}. {visual}. Include a polished brand-forward composition, modern lighting, clean product/service presentation, subtle text overlay reading \"{caption}\", and a clear CTA: {blueprint.CallToAction}.";
     }
+}
+
+internal static class LocalAdImageRenderer
+{
+    public static string Generate(LocalAdBlueprint blueprint, string model)
+    {
+        var headline = EscapeXml(blueprint.Hook);
+        var title = EscapeXml(blueprint.AdTitle.Replace(" Commercial Blueprint", "", StringComparison.OrdinalIgnoreCase));
+        var caption = EscapeXml(blueprint.Captions.FirstOrDefault() ?? blueprint.EmotionalAngle);
+        var cta = EscapeXml(blueprint.CallToAction);
+        var visual = EscapeXml(blueprint.Scenes.FirstOrDefault()?.VisualPrompt ?? blueprint.EmotionalAngle);
+        var svg = $$"""
+            <svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1080" viewBox="0 0 1080 1080">
+              <defs>
+                <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0" stop-color="#111827"/>
+                  <stop offset="0.55" stop-color="#0f766e"/>
+                  <stop offset="1" stop-color="#f59e0b"/>
+                </linearGradient>
+                <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+                  <feDropShadow dx="0" dy="22" stdDeviation="22" flood-color="#000000" flood-opacity="0.35"/>
+                </filter>
+              </defs>
+              <rect width="1080" height="1080" fill="url(#bg)"/>
+              <circle cx="830" cy="180" r="180" fill="#ffffff" opacity="0.10"/>
+              <circle cx="160" cy="880" r="260" fill="#ffffff" opacity="0.08"/>
+              <rect x="86" y="92" width="908" height="896" rx="36" fill="#ffffff" opacity="0.96" filter="url(#shadow)"/>
+              <rect x="126" y="132" width="828" height="370" rx="28" fill="#111827"/>
+              <rect x="168" y="178" width="210" height="278" rx="24" fill="#f59e0b"/>
+              <rect x="198" y="212" width="150" height="128" rx="16" fill="#fff7ed"/>
+              <circle cx="226" cy="385" r="16" fill="#10b981"/>
+              <circle cx="274" cy="385" r="16" fill="#10b981"/>
+              <circle cx="322" cy="385" r="16" fill="#10b981"/>
+              <path d="M458 220h330" stroke="#ffffff" stroke-width="28" stroke-linecap="round" opacity="0.95"/>
+              <path d="M458 292h410" stroke="#ffffff" stroke-width="18" stroke-linecap="round" opacity="0.70"/>
+              <path d="M458 348h360" stroke="#ffffff" stroke-width="18" stroke-linecap="round" opacity="0.55"/>
+              <text x="126" y="585" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="700" fill="#0f766e">{{title}}</text>
+              <foreignObject x="126" y="620" width="828" height="170">
+                <div xmlns="http://www.w3.org/1999/xhtml" style="font-family: Arial, Helvetica, sans-serif; font-size: 58px; line-height: 1.04; font-weight: 800; color: #111827;">{{headline}}</div>
+              </foreignObject>
+              <foreignObject x="126" y="790" width="828" height="92">
+                <div xmlns="http://www.w3.org/1999/xhtml" style="font-family: Arial, Helvetica, sans-serif; font-size: 29px; line-height: 1.25; color: #475569;">{{caption}}</div>
+              </foreignObject>
+              <rect x="126" y="900" width="520" height="78" rx="18" fill="#10b981"/>
+              <text x="158" y="950" font-family="Arial, Helvetica, sans-serif" font-size="30" font-weight="800" fill="#ffffff">{{cta}}</text>
+              <title>{{visual}}</title>
+            </svg>
+            """;
+
+        var dataUrl = $"data:image/svg+xml;charset=utf-8,{Uri.EscapeDataString(svg)}";
+        return JsonSerializer.Serialize(new ImageGenerationResult(
+            Type: "image",
+            Model: string.IsNullOrWhiteSpace(model) ? "local-svg-ad-renderer" : model,
+            Prompt: AdvertisementMediaPromptBuilder.BuildImagePrompt(blueprint),
+            ImageUrl: null,
+            ImageDataUrl: dataUrl,
+            Message: "Generated a local SVG ad image with no external API key or queued image provider."));
+    }
+
+    private static string EscapeXml(string value) =>
+        value.Replace("&", "&amp;")
+            .Replace("<", "&lt;")
+            .Replace(">", "&gt;")
+            .Replace("\"", "&quot;");
 }
 
 internal static class VideoManifestGenerator
