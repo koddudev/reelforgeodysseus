@@ -348,6 +348,9 @@ internal static class ImageGenerator
 {
     private static readonly HashSet<string> ImageModels = new(StringComparer.OrdinalIgnoreCase)
     {
+        "pollinations",
+        "flux",
+        "stable-diffusion",
         "gpt-image-1.5",
         "gpt-image-1",
         "gpt-image-1-mini",
@@ -374,14 +377,13 @@ internal static class ImageGenerator
         var apiKey = configuration["OpenAI:ApiKey"] ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? "";
         if (string.IsNullOrWhiteSpace(apiKey))
         {
-            return JsonSerializer.Serialize(new ImageGenerationResult(
-                Type: "image_generation_error",
-                Model: model,
-                Prompt: message,
-                ImageUrl: null,
-                ImageDataUrl: null,
-                Message: "OPENAI_API_KEY is not configured on this app service. Add it as an Azure App Service application setting to generate real images."));
+            return GeneratePollinationsResponse(message, model, "OPENAI_API_KEY is not configured, so a no-key Pollinations image URL was returned instead.");
         }
+
+        if (model.Equals("pollinations", StringComparison.OrdinalIgnoreCase)
+            || model.Equals("flux", StringComparison.OrdinalIgnoreCase)
+            || model.Equals("stable-diffusion", StringComparison.OrdinalIgnoreCase))
+            return GeneratePollinationsResponse(message, model, "No-key Pollinations image URL generated.");
 
         var prompt = NormalizeImagePrompt(message);
         using var http = httpClientFactory.CreateClient();
@@ -434,6 +436,21 @@ internal static class ImageGenerator
         return trimmed
             .Replace("Can you show me", "Show", StringComparison.OrdinalIgnoreCase)
             .Replace("Could you show me", "Show", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GeneratePollinationsResponse(string message, string model, string note)
+    {
+        var prompt = NormalizeImagePrompt(message);
+        var encodedPrompt = Uri.EscapeDataString(prompt);
+        var imageUrl = $"https://image.pollinations.ai/prompt/{encodedPrompt}?width=1024&height=1024&nologo=true";
+
+        return JsonSerializer.Serialize(new ImageGenerationResult(
+            Type: "image",
+            Model: string.IsNullOrWhiteSpace(model) ? "pollinations" : model,
+            Prompt: prompt,
+            ImageUrl: imageUrl,
+            ImageDataUrl: null,
+            Message: note));
     }
 
     private static string Shorten(string value, int maxLength) =>
