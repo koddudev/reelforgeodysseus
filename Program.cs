@@ -89,12 +89,13 @@ app.MapPost("/api/chat", async (OdysseusChatRequest request, IHttpClientFactory 
         new OdysseusSession(sessionId, requestedModel, "reelforge-dotnet", "/api/chat", DateTimeOffset.UtcNow),
         (_, current) => current with { Model = requestedModel });
 
-    var response = await ChatRouter.GetResponseAsync(request.Message, requestedModel, httpClientFactory, configuration, cancellationToken);
+    var response = await ChatRouter.GetResponseAsync(request.Message, request.Type, requestedModel, httpClientFactory, configuration, cancellationToken);
     return Results.Ok(new
     {
         response,
         session = sessionId,
-        model = requestedModel
+        model = requestedModel,
+        type = ValueOrDefault(request.Type, "auto")
     });
 })
     .WithName("Chat")
@@ -121,7 +122,8 @@ internal sealed record OdysseusChatRequest(
     string[]? Attachments,
     [property: JsonPropertyName("use_web")] bool UseWeb,
     [property: JsonPropertyName("use_research")] bool UseResearch,
-    string? Model);
+    string? Model,
+    string? Type);
 
 internal sealed record LocalAdBlueprint(
     string AdTitle,
@@ -301,8 +303,27 @@ internal static class BlueprintGenerator
 
 internal static class ChatRouter
 {
-    public static async Task<string> GetResponseAsync(string message, string model, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken)
+    public static async Task<string> GetResponseAsync(string message, string? requestedType, string model, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken)
     {
+        var type = (requestedType ?? "").Trim().ToLowerInvariant();
+        if (type is "image" or "img" or "picture")
+        {
+            var imagePrompt = IsAdvertisementBlueprintRequest(message)
+                ? AdvertisementMediaPromptBuilder.BuildImagePrompt(BlueprintGenerator.Generate(message))
+                : message;
+            var imageModel = ImageGenerator.IsKnownImageModel(model) ? model : "pollinations";
+            return await ImageGenerator.GenerateAsync(imagePrompt, imageModel, httpClientFactory, configuration, cancellationToken);
+        }
+
+        if (type is "video" or "reel")
+            return VideoManifestGenerator.Generate(message);
+
+        if (type is "blueprint" or "ad-blueprint")
+        {
+            var blueprint = BlueprintGenerator.Generate(message);
+            return JsonSerializer.Serialize(blueprint, JsonOptions.Default.LocalAdBlueprint);
+        }
+
         if (IsAdvertisementBlueprintRequest(message))
         {
             var blueprint = BlueprintGenerator.Generate(message);
@@ -327,6 +348,55 @@ internal static class ChatRouter
             || lower.Contains("source topic/supporting information:")
             || lower.Contains("video reel")
             || lower.Contains("media-generation request");
+    }
+}
+
+internal static class AdvertisementMediaPromptBuilder
+{
+    public static string BuildImagePrompt(LocalAdBlueprint blueprint)
+    {
+        var firstScene = blueprint.Scenes.FirstOrDefault();
+        var visual = firstScene?.VisualPrompt ?? blueprint.Hook;
+        var caption = blueprint.Captions.FirstOrDefault() ?? blueprint.CallToAction;
+        return $"Premium commercial social ad image for {blueprint.AdTitle}. {visual}. Include a polished brand-forward composition, modern lighting, clean product/service presentation, subtle text overlay reading \"{caption}\", and a clear CTA: {blueprint.CallToAction}.";
+    }
+}
+
+internal static class VideoManifestGenerator
+{
+    public static string Generate(string message)
+    {
+        var blueprint = BlueprintGenerator.Generate(message);
+        return JsonSerializer.Serialize(new
+        {
+            Type = "video",
+            Model = "reelforge-video-manifest-v1",
+            VideoUrl = (string?)null,
+            Message = "A no-key hosted video renderer is not configured. Returned a video-ready render manifest with timed scenes, voiceover, music, captions, transitions, and asset prompts.",
+            Title = blueprint.AdTitle,
+            AspectRatio = "9:16",
+            DurationSeconds = 30,
+            VoiceoverScript = blueprint.VoiceoverScript,
+            MusicDirection = blueprint.MusicDirection,
+            Captions = blueprint.Captions,
+            Scenes = blueprint.Scenes.Select(scene => new
+            {
+                scene.SceneNumber,
+                scene.StartTime,
+                scene.EndTime,
+                scene.Purpose,
+                scene.VisualPrompt,
+                scene.CameraDirection,
+                scene.MotionDirection,
+                scene.OnScreenText,
+                scene.VoiceoverSegment,
+                Transition = $"{scene.TransitionIn} -> {scene.TransitionOut}",
+                scene.BrollType,
+                scene.EmotionalTone
+            }),
+            CallToAction = blueprint.CallToAction,
+            TtsDirection = blueprint.TtsDirection
+        });
     }
 }
 
@@ -362,7 +432,7 @@ internal static class ImageGenerator
 
     public static bool IsImageGenerationRequest(string message, string model)
     {
-        if (ImageModels.Contains(model)) return true;
+        if (IsKnownImageModel(model)) return true;
 
         var lower = message.ToLowerInvariant();
         return lower.Contains("show me a picture")
@@ -373,6 +443,8 @@ internal static class ImageGenerator
             || lower.Contains("picture of")
             || lower.Contains("image of");
     }
+
+    public static bool IsKnownImageModel(string model) => ImageModels.Contains(model);
 
     public static async Task<string> GenerateAsync(string message, string model, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken)
     {
