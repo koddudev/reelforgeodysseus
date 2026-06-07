@@ -1,10 +1,13 @@
 using System.Collections.Concurrent;
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddHttpClient();
 builder.Services.AddSwaggerGen(options =>
 {
     options.SwaggerDoc("v1", new OpenApiInfo
@@ -76,17 +79,22 @@ app.MapPost("/session", async (HttpRequest request) =>
     .WithName("CreateSession")
     .WithOpenApi();
 
-app.MapPost("/api/chat", (OdysseusChatRequest request) =>
+app.MapPost("/api/chat", async (OdysseusChatRequest request, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken) =>
 {
     var sessionId = ValueOrDefault(request.Session, Guid.NewGuid().ToString("N"));
-    sessions.TryAdd(sessionId, new OdysseusSession(sessionId, "reelforge-commercial-blueprint-v1", "reelforge-dotnet", "/api/chat", DateTimeOffset.UtcNow));
+    var existing = sessions.GetValueOrDefault(sessionId);
+    var requestedModel = ValueOrDefault(request.Model, existing?.Model ?? "reelforge-commercial-blueprint-v1");
+    sessions.AddOrUpdate(
+        sessionId,
+        new OdysseusSession(sessionId, requestedModel, "reelforge-dotnet", "/api/chat", DateTimeOffset.UtcNow),
+        (_, current) => current with { Model = requestedModel });
 
-    var response = ChatRouter.GetResponse(request.Message);
+    var response = await ChatRouter.GetResponseAsync(request.Message, requestedModel, httpClientFactory, configuration, cancellationToken);
     return Results.Ok(new
     {
         response,
         session = sessionId,
-        model = sessions[sessionId].Model
+        model = requestedModel
     });
 })
     .WithName("Chat")
@@ -112,7 +120,8 @@ internal sealed record OdysseusChatRequest(
     string? Session,
     string[]? Attachments,
     [property: JsonPropertyName("use_web")] bool UseWeb,
-    [property: JsonPropertyName("use_research")] bool UseResearch);
+    [property: JsonPropertyName("use_research")] bool UseResearch,
+    string? Model);
 
 internal sealed record LocalAdBlueprint(
     string AdTitle,
@@ -292,8 +301,11 @@ internal static class BlueprintGenerator
 
 internal static class ChatRouter
 {
-    public static string GetResponse(string message)
+    public static async Task<string> GetResponseAsync(string message, string model, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken)
     {
+        if (ImageGenerator.IsImageGenerationRequest(message, model))
+            return await ImageGenerator.GenerateAsync(message, model, httpClientFactory, configuration, cancellationToken);
+
         if (IsAdvertisementBlueprintRequest(message))
         {
             var blueprint = BlueprintGenerator.Generate(message);
@@ -331,6 +343,110 @@ internal static class GeneralChatResponder
         return "I can answer general questions and also generate ReelForge ad blueprints. For media generation, send a prompt that includes a creative brief or asks for an advertisement blueprint.";
     }
 }
+
+internal static class ImageGenerator
+{
+    private static readonly HashSet<string> ImageModels = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "gpt-image-1.5",
+        "gpt-image-1",
+        "gpt-image-1-mini",
+        "dall-e-3",
+        "dall-e-2"
+    };
+
+    public static bool IsImageGenerationRequest(string message, string model)
+    {
+        if (ImageModels.Contains(model)) return true;
+
+        var lower = message.ToLowerInvariant();
+        return lower.Contains("show me a picture")
+            || lower.Contains("generate an image")
+            || lower.Contains("create an image")
+            || lower.Contains("make an image")
+            || lower.Contains("draw ")
+            || lower.Contains("picture of")
+            || lower.Contains("image of");
+    }
+
+    public static async Task<string> GenerateAsync(string message, string model, IHttpClientFactory httpClientFactory, IConfiguration configuration, CancellationToken cancellationToken)
+    {
+        var apiKey = configuration["OpenAI:ApiKey"] ?? Environment.GetEnvironmentVariable("OPENAI_API_KEY") ?? "";
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            return JsonSerializer.Serialize(new ImageGenerationResult(
+                Type: "image_generation_error",
+                Model: model,
+                Prompt: message,
+                ImageUrl: null,
+                ImageDataUrl: null,
+                Message: "OPENAI_API_KEY is not configured on this app service. Add it as an Azure App Service application setting to generate real images."));
+        }
+
+        var prompt = NormalizeImagePrompt(message);
+        using var http = httpClientFactory.CreateClient();
+        http.Timeout = TimeSpan.FromMinutes(3);
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey.Trim());
+
+        var payload = new
+        {
+            model,
+            prompt,
+            size = "1024x1024",
+            n = 1
+        };
+
+        using var requestBody = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        using var response = await http.PostAsync("https://api.openai.com/v1/images/generations", requestBody, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            return JsonSerializer.Serialize(new ImageGenerationResult(
+                Type: "image_generation_error",
+                Model: model,
+                Prompt: prompt,
+                ImageUrl: null,
+                ImageDataUrl: null,
+                Message: $"OpenAI image generation failed: {(int)response.StatusCode} {response.ReasonPhrase}. {Shorten(body, 800)}"));
+        }
+
+        using var document = JsonDocument.Parse(body);
+        var firstImage = document.RootElement.GetProperty("data").EnumerateArray().FirstOrDefault();
+        var imageUrl = firstImage.TryGetProperty("url", out var urlElement) ? urlElement.GetString() : null;
+        var b64 = firstImage.TryGetProperty("b64_json", out var b64Element) ? b64Element.GetString() : null;
+        var revisedPrompt = firstImage.TryGetProperty("revised_prompt", out var revisedElement) ? revisedElement.GetString() : null;
+
+        return JsonSerializer.Serialize(new ImageGenerationResult(
+            Type: "image",
+            Model: model,
+            Prompt: revisedPrompt ?? prompt,
+            ImageUrl: imageUrl,
+            ImageDataUrl: string.IsNullOrWhiteSpace(b64) ? null : $"data:image/png;base64,{b64}",
+            Message: string.IsNullOrWhiteSpace(b64) && string.IsNullOrWhiteSpace(imageUrl)
+                ? "The image provider succeeded, but no image URL or base64 image was returned."
+                : "Image generated successfully."));
+    }
+
+    private static string NormalizeImagePrompt(string message)
+    {
+        var trimmed = message.Trim();
+        if (trimmed.EndsWith("?")) trimmed = trimmed[..^1];
+        return trimmed
+            .Replace("Can you show me", "Show", StringComparison.OrdinalIgnoreCase)
+            .Replace("Could you show me", "Show", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string Shorten(string value, int maxLength) =>
+        value.Length <= maxLength ? value : value[..maxLength].TrimEnd() + "...";
+}
+
+internal sealed record ImageGenerationResult(
+    string Type,
+    string Model,
+    string Prompt,
+    string? ImageUrl,
+    string? ImageDataUrl,
+    string Message);
 
 [JsonSerializable(typeof(LocalAdBlueprint))]
 internal sealed partial class JsonOptions : JsonSerializerContext
